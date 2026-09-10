@@ -1,5 +1,6 @@
 #! /usr/bin/env python3
 
+import math
 import threading
 import time
 
@@ -241,6 +242,25 @@ def navigate_to(navigator, goal_pose, should_abort=None):
     return navigator.getResult()
 
 
+def spin_in_place(navigator, should_abort=None):
+    """Do a stationary full turn so the laser sweeps the surroundings.
+
+    A frontier can sit inside the controller's own goal tolerance (0.25m, see
+    param_nav2.yaml): nav2 then declares it "reached" without the robot actually
+    moving, so the map never grows and no further frontier ever appears. A spin costs
+    no risk of collision (it doesn't drive anywhere) and unblocks that case.
+    """
+    if not navigator.spin(spin_dist=2 * math.pi, time_allowance=30):
+        return TaskResult.FAILED
+
+    while not navigator.isTaskComplete():
+        if should_abort is not None and should_abort():
+            navigator.cancelTask()
+            break
+
+    return navigator.getResult()
+
+
 def main():
     rclpy.init()
 
@@ -271,6 +291,7 @@ def main():
         return (round(point[0], 1), round(point[1], 1))
 
     last_frontier_time = time.time()
+    spun_in_place = False
 
     while rclpy.ok():
         if len(apriltags.found_ids) >= TARGET_TAG_COUNT:
@@ -283,12 +304,18 @@ def main():
         candidates = [f for f in frontiers.frontiers if frontier_key(f) not in failed_frontiers]
 
         if not candidates:
+            if not spun_in_place:
+                print('No known frontiers: turning in place to look around.')
+                spin_in_place(navigator, should_abort=mission_done)
+                spun_in_place = True
+                continue
             if time.time() - last_frontier_time > NO_FRONTIER_TIMEOUT:
                 print('No more frontiers left: exploration complete.')
                 break
             time.sleep(1.0)
             continue
 
+        spun_in_place = False
         last_frontier_time = time.time()
 
         # Go to the frontier closest to the robot's current position.
