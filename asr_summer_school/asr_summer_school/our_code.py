@@ -318,8 +318,6 @@ def main():
             time.sleep(1.0)
             continue
 
-        last_frontier_time = time.time()
-
         # Go to the frontier closest to the robot's current position.
         robot_x, robot_y = 0.0, 0.0
         if sensors.odom is not None:
@@ -357,6 +355,10 @@ def main():
         elif result in (TaskResult.CANCELED, TaskResult.FAILED):
             print('Could not reach that frontier, trying another one.')
             failed_frontiers.add(frontier_key((frontier_x, frontier_y)))
+
+        # Reset the "no frontiers left" clock only once we're idle again: NO_FRONTIER_TIMEOUT
+        # should measure how long we've had nothing to chase, not how long the last drive took.
+        last_frontier_time = time.time()
 
     found = apriltags.found_ids
     print(f'AprilTags found: {found} ({len(found)}/{TARGET_TAG_COUNT})')
