@@ -39,6 +39,12 @@ MISSION_TIME_LIMIT = 4 * 60.0
 # Number of distinct AprilTags placed in the maze.
 TARGET_TAG_COUNT = 12
 
+# Minimum distance (m) a navigation goal must be from the robot to force real movement.
+# Must clear xy_goal_tolerance (0.25m, see param_nav2.yaml), otherwise nav2 declares the
+# goal reached on the spot. Kept comfortably under the maze's minimum 1m corridor length
+# (see MIN_OPEN in generate_apriltag_maze.py) so the push stays inside open space.
+MIN_TRAVEL_DISTANCE = 0.35
+
 # Robot frame used to look up the starting pose in the map, and to return to it later.
 # Matches `robot_base_frame` in param_nav2.yaml.
 ROBOT_FRAME = 'base_link'
@@ -128,24 +134,46 @@ class AprilTagMapper(Node):
             except tf2.TransformException:
                 continue
 
-            marker = Marker()
-            marker.header.frame_id = self.map_frame
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = 'apriltags'
-            marker.id = tag.id
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            marker.pose.position.x = tf.transform.translation.x
-            marker.pose.position.y = tf.transform.translation.y
-            marker.pose.position.z = tf.transform.translation.z
-            marker.pose.orientation.w = 1.0
-            marker.scale.x = marker.scale.y = marker.scale.z = 0.25
-            marker.color.a = 1.0
-            marker.color.g = 1.0
+            stamp = self.get_clock().now().to_msg()
+            x = tf.transform.translation.x
+            y = tf.transform.translation.y
+            z = tf.transform.translation.z
+
+            square = Marker()
+            square.header.frame_id = self.map_frame
+            square.header.stamp = stamp
+            square.ns = 'apriltags'
+            square.id = tag.id
+            square.type = Marker.CUBE
+            square.action = Marker.ADD
+            square.pose.position.x = x
+            square.pose.position.y = y
+            square.pose.position.z = z
+            square.pose.orientation.w = 1.0
+            square.scale.x = square.scale.y = 0.25
+            square.scale.z = 0.05
+            square.color.a = 1.0
+            # r, g, b default to 0.0: black.
+
+            label = Marker()
+            label.header.frame_id = self.map_frame
+            label.header.stamp = stamp
+            label.ns = 'apriltag_labels'
+            label.id = tag.id
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.text = str(tag.id)
+            label.pose.position.x = x
+            label.pose.position.y = y
+            label.pose.position.z = z + 0.25
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.2
+            label.color.a = 1.0
+            label.color.r = label.color.g = label.color.b = 1.0
 
             with self._lock:
                 new_tag_found = new_tag_found or tag.id not in self._found
-                self._found[tag.id] = marker
+                self._found[tag.id] = (square, label)
 
         if new_tag_found:
             self._publish_markers()
@@ -153,7 +181,7 @@ class AprilTagMapper(Node):
 
     def _publish_markers(self):
         with self._lock:
-            markers = list(self._found.values())
+            markers = [marker for pair in self._found.values() for marker in pair]
         self.marker_pub.publish(MarkerArray(markers=markers))
 
     @property
@@ -242,25 +270,6 @@ def navigate_to(navigator, goal_pose, should_abort=None):
     return navigator.getResult()
 
 
-def spin_in_place(navigator, should_abort=None):
-    """Do a stationary full turn so the laser sweeps the surroundings.
-
-    A frontier can sit inside the controller's own goal tolerance (0.25m, see
-    param_nav2.yaml): nav2 then declares it "reached" without the robot actually
-    moving, so the map never grows and no further frontier ever appears. A spin costs
-    no risk of collision (it doesn't drive anywhere) and unblocks that case.
-    """
-    if not navigator.spin(spin_dist=2 * math.pi, time_allowance=30):
-        return TaskResult.FAILED
-
-    while not navigator.isTaskComplete():
-        if should_abort is not None and should_abort():
-            navigator.cancelTask()
-            break
-
-    return navigator.getResult()
-
-
 def main():
     rclpy.init()
 
@@ -291,7 +300,6 @@ def main():
         return (round(point[0], 1), round(point[1], 1))
 
     last_frontier_time = time.time()
-    spun_in_place = False
 
     while rclpy.ok():
         if len(apriltags.found_ids) >= TARGET_TAG_COUNT:
@@ -304,18 +312,12 @@ def main():
         candidates = [f for f in frontiers.frontiers if frontier_key(f) not in failed_frontiers]
 
         if not candidates:
-            if not spun_in_place:
-                print('No known frontiers: turning in place to look around.')
-                spin_in_place(navigator, should_abort=mission_done)
-                spun_in_place = True
-                continue
             if time.time() - last_frontier_time > NO_FRONTIER_TIMEOUT:
                 print('No more frontiers left: exploration complete.')
                 break
             time.sleep(1.0)
             continue
 
-        spun_in_place = False
         last_frontier_time = time.time()
 
         # Go to the frontier closest to the robot's current position.
@@ -323,11 +325,25 @@ def main():
         if sensors.odom is not None:
             robot_x = sensors.odom.pose.pose.position.x
             robot_y = sensors.odom.pose.pose.position.y
-        target_x, target_y = min(
+        frontier_x, frontier_y = min(
             candidates, key=lambda p: (p[0] - robot_x) ** 2 + (p[1] - robot_y) ** 2)
 
+        # A frontier inside nav2's own goal tolerance (0.25m, see param_nav2.yaml) gets
+        # declared "reached" on the spot, without the robot moving at all -- and since
+        # its lidar already covers 360 degrees, standing still reveals nothing new
+        # either. Push the actual goal further out along the same bearing so reaching
+        # it requires real movement. Safe to plan into: the global costmap allows
+        # planning through unknown space (allow_unknown: true), and the maze generator
+        # guarantees >= 1m of open corridor past any tag-bearing wall.
+        target_x, target_y = frontier_x, frontier_y
+        dist = math.hypot(frontier_x - robot_x, frontier_y - robot_y)
+        if 1e-3 < dist < MIN_TRAVEL_DISTANCE:
+            scale = MIN_TRAVEL_DISTANCE / dist
+            target_x = robot_x + (frontier_x - robot_x) * scale
+            target_y = robot_y + (frontier_y - robot_y) * scale
+
         goal_pose = make_goal_pose(navigator, frontiers.frame_id, target_x, target_y)
-        print(f'Heading to frontier at x={target_x:.2f}, y={target_y:.2f}')
+        print(f'Heading to frontier at x={frontier_x:.2f}, y={frontier_y:.2f}')
         result = navigate_to(navigator, goal_pose, should_abort=mission_done)
 
         if result == TaskResult.SUCCEEDED:
@@ -335,12 +351,12 @@ def main():
             # If the frontier detector still republishes this same centroid after we've
             # reached it (e.g. a spot in the robot's own blind spot that never clears),
             # exclude it too, otherwise we'd pick it again forever.
-            failed_frontiers.add(frontier_key((target_x, target_y)))
+            failed_frontiers.add(frontier_key((frontier_x, frontier_y)))
         elif result == TaskResult.CANCELED and mission_done():
             print('Aborting current approach: mission done.')
         elif result in (TaskResult.CANCELED, TaskResult.FAILED):
             print('Could not reach that frontier, trying another one.')
-            failed_frontiers.add(frontier_key((target_x, target_y)))
+            failed_frontiers.add(frontier_key((frontier_x, frontier_y)))
 
     found = apriltags.found_ids
     print(f'AprilTags found: {found} ({len(found)}/{TARGET_TAG_COUNT})')
