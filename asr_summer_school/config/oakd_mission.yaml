@@ -1,0 +1,8 @@
+/**:
+  ros__parameters:
+    use_sim_time: false
+    camera:
+      i_enable_imu: false
+      i_enable_ir: false
+      i_nn_type: none
+      i_pipeline_type: RGB

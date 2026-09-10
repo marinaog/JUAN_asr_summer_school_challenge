@@ -110,4 +110,16 @@ The package also contains `frontier_detection`, its ROS 2 node entry point, Pyth
 - `turtlebot3_simulations` provides the TurtleBot3 fake node and Gazebo simulation packages. The source tree also includes an Ignition simulation package, currently marked with `COLCON_IGNORE`.
 - `apriltag-imgs` contains the supported AprilTag families and the `tag_to_svg.py` conversion utility.
 
-The current package supplies the robot bringup, mapping, navigation, teleoperation, and perception foundations. The autonomous exploration policy, unique-tag management, transformation and storage of detections in the map frame, semantic-map export, and timed return-to-start behavior are the main components to be developed as part of the challenge.
+The package supplies the robot bringup, mapping, navigation, teleoperation, and perception foundations, together with the onboard mission implementation described below. Physical calibration, performance tuning, and full challenge validation must be completed on the robot.
+
+
+### Onboard autonomous mission
+
+The navigation example now implements the search-and-rescue mission controller,
+with OAK-D detection, frontier exploration, unique map-frame tag recording,
+optional wall-clock duration, operator-requested return, and map exports.
+See [the onboard mission guide](asr_summer_school/MISSION.md) for setup,
+calibration, timed/stopwatch operation, test commands, and hardware-validation
+limitations. The hardware workflow launches with
+`ros2 launch asr_summer_school mission.launch.py`; motion begins only after
+`/mission/start` succeeds. Omit `mission_duration_sec` for stopwatch-only operation.

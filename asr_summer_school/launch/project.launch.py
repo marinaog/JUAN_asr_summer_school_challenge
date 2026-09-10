@@ -55,6 +55,30 @@ def generate_launch_description():
         launch_arguments={"x_pose": x_pose, "y_pose": y_pose}.items(),
     )
 
+# --- APRILTAG NODE CONFIGURATION ---
+    tags_config_path = os.path.join(
+          get_package_share_directory('turtlebot3_perception'),
+          'config',
+          'apriltag.yaml',
+      )
+
+    apriltag_node = Node(
+          package='apriltag_ros',
+          executable='apriltag_node',
+          namespace='camera',
+          name='apriltag',
+          output='screen',
+          parameters=[
+              tags_config_path,
+              {'use_sim_time': use_sim_time},
+          ],
+          remappings=[
+              ('image_rect', '/camera/image_raw'),
+              ('camera_info', '/camera/camera_info'),
+          ],
+      )
+
+    # -----------------------------------
     ld = LaunchDescription()
 
     # Add the commands to the launch description
@@ -63,4 +87,5 @@ def generate_launch_description():
     ld.add_action(robot_state_publisher_cmd)
     ld.add_action(spawn_turtlebot_cmd)
 
+    ld.add_action(apriltag_node)
     return ld

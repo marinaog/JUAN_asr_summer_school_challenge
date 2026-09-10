@@ -12,6 +12,7 @@ find_package(rclcpp_components REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 add_library(frontier_detection
   src/frontier_detection.cpp
@@ -32,7 +33,7 @@ add_library(frontier_detection_node SHARED
   src/frontier_detection_node.cpp
 )
 target_link_libraries(frontier_detection_node frontier_detection)
-ament_target_dependencies(frontier_detection_node rclcpp rclcpp_components nav_msgs geometry_msgs visualization_msgs)
+ament_target_dependencies(frontier_detection_node rclcpp rclcpp_components nav_msgs geometry_msgs visualization_msgs tf2_ros)
 rclcpp_components_register_node(frontier_detection_node
   PLUGIN "FrontierDetectionNode"
   EXECUTABLE frontier_detection_node_exe
@@ -42,6 +43,7 @@ ament_python_install_package(${PROJECT_NAME})
 
 install(PROGRAMS
   ${PROJECT_NAME}/example_nav_to_pose.py
+  ${PROJECT_NAME}/tag_mapper.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -63,6 +65,15 @@ install(DIRECTORY launch config test worlds models
 ament_environment_hooks("${CMAKE_CURRENT_SOURCE_DIR}/env-hooks/${PROJECT_NAME}.dsv.in")
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(mission_tests test/test_mission.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60)
+  ament_add_pytest_test(mission_ros_tests test/test_mission_ros.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=1 ROS_DOMAIN_ID=91
+      ROS_LOG_DIR=/tmp/asr_mission_test_logs
+    TIMEOUT 60)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files

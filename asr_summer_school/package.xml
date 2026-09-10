@@ -17,8 +17,22 @@
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>tf2_ros</depend>
+  <exec_depend>apriltag_msgs</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>action_msgs</exec_depend>
+  <exec_depend>lifecycle_msgs</exec_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>depthai_ros_driver</exec_depend>
+  <exec_depend>image_proc</exec_depend>
+  <exec_depend>turtlebot3_bringup</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
   <depend>visualization_msgs</depend>
-  
+
   <depend>joy_linux</depend>
   <depend>nav2_simple_commander</depend>
   <depend>navigation2</depend>
@@ -26,6 +40,10 @@
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
+
+  <exec_depend>apriltag_ros</exec_depend>
+  <exec_depend>turtlebot3_perception</exec_depend>
+
 
   <export>
     <build_type>ament_cmake</build_type>

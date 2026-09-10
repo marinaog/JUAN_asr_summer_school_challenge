@@ -1,0 +1,28 @@
+/**:
+  ros__parameters:
+    use_sim_time: false
+    mission_duration_sec: 0.0  # 0: stopwatch/operator controls when to return
+    return_reserve_sec: 30.0
+    return_speed_mps: 0.10
+    goal_timeout_sec: 120.0
+    return_timeout_sec: 180.0
+    failed_cooldown_sec: 60.0
+    save_interval_sec: 30.0
+    footprint_radius_m: 0.15  # Measure loaded robot; used for known-space path checks
+    sensor_timeout_sec: 3.0
+    observe_sec: 15.0
+    map_frame: map
+    base_frame: base_link
+    camera_info_topic: /camera/camera/color/camera_info
+    detections_topic: /camera/detections
+    tf_wait_sec: 1.0
+    consistency_m: 0.30
+    challenge_mode: false
+    turn_speed_rps: 0.4
+    planning_allowance_sec: 10.0
+    recovery_allowance_sec: 20.0
+    late_return_timeout_sec: 120.0
+    selection_timeout_sec: 5.0
+    speed_profiles_enabled: false
+    exploration_speed_mps: 0.0  # Required measured cap when enabled
+    return_limit_mps: 0.0       # Required measured cap, at most 0.22

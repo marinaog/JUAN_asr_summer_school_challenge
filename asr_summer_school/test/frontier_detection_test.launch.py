@@ -40,6 +40,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'map_topic': 'map',
+                'use_tf_pose': False,
                 'epsilon': 0.5,
                 'min_points': 3,
                 'min_frontier_size': 5,
