@@ -1,0 +1,23 @@
+/**:
+  ros__parameters:
+    # our_code.py always overrides this at launch with -p use_sim_time:=..., matching
+    # whatever `use_sim_time:=true|false` it was itself invoked with. This default only
+    # applies if you run explore_lite by hand with this file.
+    use_sim_time: false
+    robot_base_frame: base_link
+    # nav2's global costmap: inflated (safer to explore against) and already publishes
+    # both a full grid and incremental updates, unlike slam_toolbox's raw /map topic.
+    costmap_topic: /global_costmap/costmap
+    costmap_updates_topic: /global_costmap/costmap_updates
+    # our_code.py owns the "when/whether to go home" decision (12 tags or 4 minutes),
+    # so explore_lite shouldn't also try to return home on its own once it runs out of
+    # frontiers.
+    return_to_init: false
+    visualize: true
+    planner_frequency: 0.15
+    progress_timeout: 30.0
+    potential_scale: 3.0
+    orientation_scale: 0.0
+    gain_scale: 1.0
+    transform_tolerance: 0.3
+    min_frontier_size: 0.5

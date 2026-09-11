@@ -1,87 +1,92 @@
 #! /usr/bin/env python3
 
-import math
+import os
+import subprocess
+import sys
 import threading
 import time
 
 from apriltag_msgs.msg import AprilTagDetectionArray
+from explore_lite_msgs.msg import ExploreStatus
 from geometry_msgs.msg import PoseStamped
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 import rclpy
 from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
+from std_msgs.msg import Bool
 import tf2_py as tf2
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
-from asr_summer_school.sensor_monitor import SensorMonitor
-
 """
-Explore the maze by driving to frontier centroids (published by
-frontier_detection_node), mapping every AprilTag seen along the way onto the
-global map, until all tags are found or the mission time budget runs out --
-then return to the starting point.
+Explore the maze with explore_lite (github.com/robo-friends/m-explore-ros2), mapping
+every AprilTag seen along the way onto the global map, until all tags are found or the
+mission time budget runs out -- then return to the starting point.
 """
 
-# How long (s) the frontier list has to stay empty before we call exploration done.
-# Must cover at least one slam_toolbox map_update_interval (5s, see param_slam_toolbox.yaml)
-# so we don't quit right between two map updates.
-NO_FRONTIER_TIMEOUT = 15.0
-
-# Total time budget (s) for finding AprilTags before heading back to the start,
-# whether or not all of them were found.
+# Total time budget (s) for finding AprilTags before heading back to the start.
 MISSION_TIME_LIMIT = 4 * 60.0
 
 # Number of distinct AprilTags placed in the maze.
 TARGET_TAG_COUNT = 12
 
-# Minimum distance (m) a navigation goal must be from the robot to force real movement.
-# Must clear xy_goal_tolerance (0.25m, see param_nav2.yaml), otherwise nav2 declares the
-# goal reached on the spot. Kept comfortably under the maze's minimum 1m corridor length
-# (see MIN_OPEN in generate_apriltag_maze.py) so the push stays inside open space.
-MIN_TRAVEL_DISTANCE = 0.35
-
-# Robot frame used to look up the starting pose in the map, and to return to it later.
-# Matches `robot_base_frame` in param_nav2.yaml.
+# Robot frame used to look up poses in the map. Matches `robot_base_frame` in
+# param_nav2.yaml and explore_lite_params.yaml.
 ROBOT_FRAME = 'base_link'
 
+# explore_lite's own params file, next to this script's package (not the installed
+# share dir: our_code.py is always run straight from source, not via ros2 run).
+EXPLORE_PARAMS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'config', 'explore_lite_params.yaml')
 
-class FrontierExplorer(Node):
-    """Caches the latest frontier centroids published by frontier_detection_node."""
 
-    def __init__(self, node_name='frontier_explorer', frontier_topic='/frontier_centroids'):
-        super().__init__(node_name)
+def use_sim_time_from_args():
+    """Read a `use_sim_time:=true|false` arg, matching this repo's launch-file convention.
+
+    Every node here needs to agree on the same clock: a node using wall-clock time
+    against a TF tree stamped with Gazebo's simulated clock (or vice versa) makes every
+    lookup fail extrapolation, since the requested time never matches available data.
+    """
+    for arg in sys.argv[1:]:
+        if arg == 'use_sim_time:=true':
+            return True
+        if arg == 'use_sim_time:=false':
+            return False
+    return False
+
+
+class ExploreStatusMonitor(Node):
+    """Caches the latest status published by explore_lite on `/explore/status`."""
+
+    def __init__(self, node_name='explore_status_monitor', status_topic='/explore/status',
+                 use_sim_time=False):
+        super().__init__(node_name, parameter_overrides=[
+            Parameter('use_sim_time', Parameter.Type.BOOL, use_sim_time)])
 
         self._lock = threading.Lock()
-        self._frontiers = []
-        self._frame_id = 'map'
+        self._status = None
 
         self.create_subscription(
-            Marker, frontier_topic, self._frontier_callback,
-            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+            ExploreStatus, status_topic, self._status_callback,
+            QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         self._executor = None
         self._thread = None
 
-    def _frontier_callback(self, msg):
+    def _status_callback(self, msg):
         with self._lock:
-            self._frontiers = [(p.x, p.y) for p in msg.points]
-            self._frame_id = msg.header.frame_id or 'map'
+            self._status = msg.status
 
     @property
-    def frontiers(self):
-        """Latest list of (x, y) frontier centroids, in `frame_id`."""
+    def complete(self):
+        """True once explore_lite reports it has run out of frontiers."""
         with self._lock:
-            return list(self._frontiers)
-
-    @property
-    def frame_id(self):
-        with self._lock:
-            return self._frame_id
+            return self._status == ExploreStatus.EXPLORATION_COMPLETE
 
     def start(self):
         if self._thread is not None:
@@ -106,8 +111,9 @@ class AprilTagMapper(Node):
     """Looks up detected AprilTags in the map frame and publishes them as persistent markers."""
 
     def __init__(self, node_name='apriltag_mapper', detections_topic='/camera/detections',
-                 marker_topic='/apriltag_markers', map_frame='map'):
-        super().__init__(node_name)
+                 marker_topic='/apriltag_markers', map_frame='map', use_sim_time=False):
+        super().__init__(node_name, parameter_overrides=[
+            Parameter('use_sim_time', Parameter.Type.BOOL, use_sim_time)])
 
         self.map_frame = map_frame
         self._lock = threading.Lock()
@@ -153,7 +159,6 @@ class AprilTagMapper(Node):
             square.scale.x = square.scale.y = 0.25
             square.scale.z = 0.05
             square.color.a = 1.0
-            # r, g, b default to 0.0: black.
 
             label = Marker()
             label.header.frame_id = self.map_frame
@@ -208,21 +213,8 @@ class AprilTagMapper(Node):
         self.destroy_node()
 
 
-def make_goal_pose(navigator, frame_id, x, y):
-    goal_pose = PoseStamped()
-    goal_pose.header.frame_id = frame_id
-    goal_pose.header.stamp = navigator.get_clock().now().to_msg()
-    goal_pose.pose.position.x = x
-    goal_pose.pose.position.y = y
-    goal_pose.pose.orientation.w = 1.0
-    return goal_pose
-
-
 def wait_for_start_pose(navigator, buffer, map_frame, robot_frame, timeout=15.0):
-    """Block until `map_frame` -> `robot_frame` is available and return it as a PoseStamped.
-
-    Captured once at startup, before any navigation, so we have somewhere to come back to.
-    """
+    """Block until map_frame -> robot_frame is available and return PoseStamped."""
     deadline = time.time() + timeout
     while True:
         try:
@@ -243,14 +235,7 @@ def wait_for_start_pose(navigator, buffer, map_frame, robot_frame, timeout=15.0)
 
 
 def navigate_to(navigator, goal_pose, should_abort=None):
-    """Drive to `goal_pose`, calling `should_abort()` (if given) to cancel early.
-
-    Returns the resulting TaskResult. A rejected goal request is reported as FAILED
-    right away instead of falling through to isTaskComplete()/getResult(), which would
-    otherwise replay the *previous* goal's already-resolved result -- goToPose() leaves
-    result_future/status untouched when a goal is rejected, so isTaskComplete() finds a
-    stale, already-done future and returns True instantly, without the robot moving.
-    """
+    """Drive to goal_pose, calling should_abort() to cancel early if conditions met."""
     if not navigator.goToPose(goal_pose):
         return TaskResult.FAILED
 
@@ -259,13 +244,11 @@ def navigate_to(navigator, goal_pose, should_abort=None):
         if should_abort is not None and should_abort():
             navigator.cancelTask()
             break
-        # AprilTag detection and marker publishing keep running in the background.
-        i = i + 1
+        i += 1
         feedback = navigator.getFeedback()
         if feedback and i % 5 == 0:
-            print('Estimated time of arrival: ' + '{0:.0f}'.format(
-                  Duration.from_msg(feedback.estimated_time_remaining).nanoseconds / 1e9)
-                  + ' seconds.')
+            eta = Duration.from_msg(feedback.estimated_time_remaining).nanoseconds / 1e9
+            print(f'Estimated time of arrival: {eta:.0f} seconds.')
 
     return navigator.getResult()
 
@@ -273,92 +256,58 @@ def navigate_to(navigator, goal_pose, should_abort=None):
 def main():
     rclpy.init()
 
+    use_sim_time = use_sim_time_from_args()
+    print(f'use_sim_time={use_sim_time}')
+
     navigator = BasicNavigator()
+    navigator.set_parameters([Parameter('use_sim_time', Parameter.Type.BOOL, use_sim_time)])
 
     # Background nodes: they spin on their own, the main loop just reads their properties.
-    sensors = SensorMonitor().start()
-    frontiers = FrontierExplorer().start()
-    apriltags = AprilTagMapper().start()
+    apriltags = AprilTagMapper(use_sim_time=use_sim_time).start()
+    explore_status = ExploreStatusMonitor(use_sim_time=use_sim_time).start()
 
-    # Wait for navigation to fully activate, since autostarting nav2
     navigator.waitUntilNav2Active(localizer='controller_server')
 
-    # Remember where we started so we can come back here, tag hunt done or not.
     print('Looking up starting pose...')
     home_pose = wait_for_start_pose(navigator, apriltags.buffer, apriltags.map_frame, ROBOT_FRAME)
     print(f'Start pose: x={home_pose.pose.position.x:.2f}, y={home_pose.pose.position.y:.2f}')
 
     mission_deadline = time.time() + MISSION_TIME_LIMIT
 
-    def mission_done():
-        return len(apriltags.found_ids) >= TARGET_TAG_COUNT or time.time() >= mission_deadline
+    # explore_lite (github.com/robo-friends/m-explore-ros2) does the actual frontier
+    # exploration: picking, blacklisting unreachable ones, and driving via Nav2 itself.
+    # We just supervise it against our own stopping conditions and pause it (rather than
+    # kill it outright) so it cancels its in-flight goal cleanly.
+    resume_pub = navigator.create_publisher(Bool, 'explore/resume', 10)
+    print('Starting explore_lite...')
+    explore_proc = subprocess.Popen([
+        'ros2', 'run', 'explore_lite', 'explore',
+        '--ros-args', '--params-file', EXPLORE_PARAMS_FILE,
+        '-p', f'use_sim_time:={str(use_sim_time).lower()}',
+    ])
 
-    # Frontiers that navigation failed to reach: skip them on future picks.
-    failed_frontiers = set()
-
-    def frontier_key(point):
-        return (round(point[0], 1), round(point[1], 1))
-
-    last_frontier_time = time.time()
-
-    while rclpy.ok():
-        if len(apriltags.found_ids) >= TARGET_TAG_COUNT:
-            print(f'Found all {TARGET_TAG_COUNT} AprilTags!')
-            break
-        if time.time() >= mission_deadline:
-            print(f'Mission time budget ({MISSION_TIME_LIMIT / 60:.0f} min) reached.')
-            break
-
-        candidates = [f for f in frontiers.frontiers if frontier_key(f) not in failed_frontiers]
-
-        if not candidates:
-            if time.time() - last_frontier_time > NO_FRONTIER_TIMEOUT:
-                print('No more frontiers left: exploration complete.')
+    try:
+        while rclpy.ok():
+            if len(apriltags.found_ids) >= TARGET_TAG_COUNT:
+                print(f'Found all {TARGET_TAG_COUNT} AprilTags!')
                 break
-            time.sleep(1.0)
-            continue
+            if time.time() >= mission_deadline:
+                print(f'Mission time budget ({MISSION_TIME_LIMIT / 60:.0f} min) reached.')
+                break
+            if explore_status.complete:
+                print('explore_lite ran out of frontiers: exploration complete.')
+                break
+            time.sleep(0.5)
 
-        # Go to the frontier closest to the robot's current position.
-        robot_x, robot_y = 0.0, 0.0
-        if sensors.odom is not None:
-            robot_x = sensors.odom.pose.pose.position.x
-            robot_y = sensors.odom.pose.pose.position.y
-        frontier_x, frontier_y = min(
-            candidates, key=lambda p: (p[0] - robot_x) ** 2 + (p[1] - robot_y) ** 2)
-
-        # A frontier inside nav2's own goal tolerance (0.25m, see param_nav2.yaml) gets
-        # declared "reached" on the spot, without the robot moving at all -- and since
-        # its lidar already covers 360 degrees, standing still reveals nothing new
-        # either. Push the actual goal further out along the same bearing so reaching
-        # it requires real movement. Safe to plan into: the global costmap allows
-        # planning through unknown space (allow_unknown: true), and the maze generator
-        # guarantees >= 1m of open corridor past any tag-bearing wall.
-        target_x, target_y = frontier_x, frontier_y
-        dist = math.hypot(frontier_x - robot_x, frontier_y - robot_y)
-        if 1e-3 < dist < MIN_TRAVEL_DISTANCE:
-            scale = MIN_TRAVEL_DISTANCE / dist
-            target_x = robot_x + (frontier_x - robot_x) * scale
-            target_y = robot_y + (frontier_y - robot_y) * scale
-
-        goal_pose = make_goal_pose(navigator, frontiers.frame_id, target_x, target_y)
-        print(f'Heading to frontier at x={frontier_x:.2f}, y={frontier_y:.2f}')
-        result = navigate_to(navigator, goal_pose, should_abort=mission_done)
-
-        if result == TaskResult.SUCCEEDED:
-            print('Reached frontier.')
-            # If the frontier detector still republishes this same centroid after we've
-            # reached it (e.g. a spot in the robot's own blind spot that never clears),
-            # exclude it too, otherwise we'd pick it again forever.
-            failed_frontiers.add(frontier_key((frontier_x, frontier_y)))
-        elif result == TaskResult.CANCELED and mission_done():
-            print('Aborting current approach: mission done.')
-        elif result in (TaskResult.CANCELED, TaskResult.FAILED):
-            print('Could not reach that frontier, trying another one.')
-            failed_frontiers.add(frontier_key((frontier_x, frontier_y)))
-
-        # Reset the "no frontiers left" clock only once we're idle again: NO_FRONTIER_TIMEOUT
-        # should measure how long we've had nothing to chase, not how long the last drive took.
-        last_frontier_time = time.time()
+        print('Stopping exploration...')
+        resume_pub.publish(Bool(data=False))
+    finally:
+        explore_proc.terminate()
+        try:
+            explore_proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            explore_proc.kill()
+            explore_proc.wait()
 
     found = apriltags.found_ids
     print(f'AprilTags found: {found} ({len(found)}/{TARGET_TAG_COUNT})')
@@ -370,9 +319,8 @@ def main():
     else:
         print('Could not fully return to the starting point.')
 
-    sensors.stop()
-    frontiers.stop()
     apriltags.stop()
+    explore_status.stop()
     navigator.lifecycleShutdown()
 
     exit(0)
