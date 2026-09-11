@@ -40,6 +40,10 @@ that the entire environment has been explored.
 # This interval starts only while idle with fresh data, never before navigation.
 NO_FRONTIER_TIMEOUT = 15.0
 GOAL_RADIUS = 0.30
+# Separate from GOAL_RADIUS (which also doubles as the arrival tolerance): reaching a
+# goal naturally reveals more frontier cells right next to it, and those shouldn't get
+# blanket-suppressed just for being close to the goal just attempted.
+COOLDOWN_RADIUS = 0.15
 MIN_GOAL_DISTANCE = 0.10
 # Frontier cells are clustered by 8-connected adjacency; a cluster whose extent (cell
 # count x resolution) is below this is ignored, so a single-cell gap next to the robot
@@ -682,7 +686,7 @@ class GoalPolicy:
                 reasons['too_close_to_robot'] += 1
                 continue
             cooldown_source = next(
-                (g for g, f, _ in self.attempts if f == frame and math.dist(point, g) <= GOAL_RADIUS),
+                (g for g, f, _ in self.attempts if f == frame and math.dist(point, g) <= COOLDOWN_RADIUS),
                 None)
             if cooldown_source is not None:
                 suppressed = True
@@ -803,7 +807,6 @@ def explore(navigator, frontiers, validator, apriltags, home_position, mission_d
     required_sequence = 0
     reports = {}
     rejections = Counter()
-    last_countdown = [0.0]
 
     def report(message, category='status'):
         previous, when = reports.get(category, (None, 0.0))
@@ -812,19 +815,8 @@ def explore(navigator, frontiers, validator, apriltags, home_position, mission_d
             navigator.get_logger().info(message)
             reports[category] = (message, now)
 
-    def print_countdown():
-        # Called both from the search loop below and from time_to_go_home() while a
-        # NavigateToPose leg is in flight, so the countdown keeps ticking during
-        # exploration and while actively driving, not just between goals.
-        now = frontiers.get_clock().now().nanoseconds/1e9
-        if now-last_countdown[0] >= 10.0:
-            remaining = max(0.0, mission_deadline-now)
-            navigator.get_logger().info(f'Mission time remaining: {remaining:.0f} s.')
-            last_countdown[0] = now
-
     while rclpy.ok():
         now = frontiers.get_clock().now().nanoseconds/1e9
-        print_countdown()
         clock_reset = policy.last_time is not None and now < policy.last_time
         policy.tick(now)
         points, point_frame, received, sequence = frontiers.snapshot()
@@ -902,7 +894,7 @@ def explore(navigator, frontiers, validator, apriltags, home_position, mission_d
             on_cooldown = sorted(
                 (g for g, f, _ in policy.attempts if f == frame),
                 key=lambda g: math.dist(g, robot))
-            report(f'Cooldown goals near robot (within {GOAL_RADIUS} m suppress candidates for '
+            report(f'Cooldown goals near robot (within {COOLDOWN_RADIUS} m suppress candidates for '
                    f'{SUCCESS_COOLDOWN:.0f}-{FAILURE_COOLDOWN:.0f} s): '
                    f'{[tuple(round(v,2) for v in g) for g in on_cooldown[:5]]}', 'cooldown')
         target = None
@@ -949,7 +941,6 @@ def explore(navigator, frontiers, validator, apriltags, home_position, mission_d
                 f'Heading to validated {source} at x={target[0]:.2f}, y={target[1]:.2f}')
             accepted = navigator.goToPose(make_goal_pose(navigator,frame,*target,robot,yaw=goal_heading))
             def time_to_go_home():
-                print_countdown()
                 if len(apriltags.found_ids) >= TARGET_TAG_COUNT:
                     return True
                 current = frontiers.robot_position(frame) or robot
