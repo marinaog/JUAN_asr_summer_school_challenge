@@ -1,6 +1,7 @@
 #! /usr/bin/env python3
 
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -280,11 +281,15 @@ def main():
     # kill it outright) so it cancels its in-flight goal cleanly.
     resume_pub = navigator.create_publisher(Bool, 'explore/resume', 10)
     print('Starting explore_lite...')
+    # `ros2 run` forks a child for the actual `explore` binary rather than exec'ing into
+    # it, so Popen.terminate() below would only kill that wrapper and orphan the real
+    # process. start_new_session=True makes this call the leader of its own process
+    # group, so os.killpg can take down the wrapper and its child together.
     explore_proc = subprocess.Popen([
         'ros2', 'run', 'explore_lite', 'explore',
         '--ros-args', '--params-file', EXPLORE_PARAMS_FILE,
         '-p', f'use_sim_time:={str(use_sim_time).lower()}',
-    ])
+    ], start_new_session=True)
 
     try:
         while rclpy.ok():
@@ -302,11 +307,11 @@ def main():
         print('Stopping exploration...')
         resume_pub.publish(Bool(data=False))
     finally:
-        explore_proc.terminate()
+        os.killpg(explore_proc.pid, signal.SIGTERM)
         try:
             explore_proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            explore_proc.kill()
+            os.killpg(explore_proc.pid, signal.SIGKILL)
             explore_proc.wait()
 
     found = apriltags.found_ids
