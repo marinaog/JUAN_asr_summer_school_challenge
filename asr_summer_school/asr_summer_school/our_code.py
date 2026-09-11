@@ -650,17 +650,23 @@ class GoalPolicy:
     def candidates(self, points, frame, robot):
         eligible = []
         suppressed = False
+        reasons = Counter()
         for point in points:
             if not all(math.isfinite(v) for v in point):
+                reasons['non_finite'] += 1
                 continue
             if math.dist(point, robot) < MIN_GOAL_DISTANCE:
+                reasons['too_close_to_robot'] += 1
                 continue
-            if any(f == frame and math.dist(point, g) <= GOAL_RADIUS
-                   for g, f, _ in self.attempts):
+            cooldown_source = next(
+                (g for g, f, _ in self.attempts if f == frame and math.dist(point, g) <= GOAL_RADIUS),
+                None)
+            if cooldown_source is not None:
                 suppressed = True
+                reasons['cooldown'] += 1
                 continue
             eligible.append(point)
-        return sorted(eligible, key=lambda p: math.dist(p, robot)), suppressed
+        return sorted(eligible, key=lambda p: math.dist(p, robot)), suppressed, reasons
 
     def idle_expired(self, kind, now):
         if self.idle_kind != kind:
@@ -841,8 +847,8 @@ def explore(navigator, frontiers, validator, apriltags, home_position, mission_d
 
         # Both sources compete on distance and heading, without source priority.
         supplied = points if point_frame == frame and time.monotonic()-received <= NO_FRONTIER_TIMEOUT else []
-        eligible, suppressed = policy.candidates(supplied,frame,robot)
-        recovered, cooling = policy.candidates(alternatives,frame,robot)
+        eligible, suppressed, supplied_reasons = policy.candidates(supplied,frame,robot)
+        recovered, cooling, alt_reasons = policy.candidates(alternatives,frame,robot)
         transform = frontiers.robot_transform(frame)
         if transform is None:
             policy.reset_idle()
@@ -852,10 +858,18 @@ def explore(navigator, frontiers, validator, apriltags, home_position, mission_d
         heading = math.atan2(2*(q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z))
         candidates = rank_candidates(eligible + recovered, robot, heading)
         suppressed |= cooling
+        filter_reasons = supplied_reasons + alt_reasons
         report(f'Goals: supplied={len(supplied)}, map-derived={len(alternatives)}, '
                f'eligible={len(candidates)}, proximity/invalid/cooldown filtered='
-               f'{len(supplied)+len(alternatives)-len(eligible)-len(recovered)}, '
-               f'path rejection counts={dict(rejections)}', 'goals')
+               f'{len(supplied)+len(alternatives)-len(eligible)-len(recovered)} '
+               f'{dict(filter_reasons)}, path rejection counts={dict(rejections)}', 'goals')
+        if filter_reasons['cooldown']:
+            on_cooldown = sorted(
+                (g for g, f, _ in policy.attempts if f == frame),
+                key=lambda g: math.dist(g, robot))
+            report(f'Cooldown goals near robot (within {GOAL_RADIUS} m suppress candidates for '
+                   f'{SUCCESS_COOLDOWN:.0f}-{FAILURE_COOLDOWN:.0f} s): '
+                   f'{[tuple(round(v,2) for v in g) for g in on_cooldown[:5]]}', 'cooldown')
         target = None
         goal_heading = None
         infrastructure_failure = False
