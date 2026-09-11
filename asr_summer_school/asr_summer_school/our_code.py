@@ -40,7 +40,7 @@ that the entire environment has been explored.
 # This interval starts only while idle with fresh data, never before navigation.
 NO_FRONTIER_TIMEOUT = 15.0
 GOAL_RADIUS = 0.30
-MIN_GOAL_DISTANCE = 0.50
+MIN_GOAL_DISTANCE = 0.10
 # Frontier cells are clustered by 8-connected adjacency; a cluster whose extent (cell
 # count x resolution) is below this is ignored, so a single-cell gap next to the robot
 # doesn't out-rank a real corridor just for being closer.
