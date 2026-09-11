@@ -22,6 +22,8 @@ from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
+from rcl_interfaces.msg import Parameter as ParameterMsg, ParameterType, ParameterValue
+from rcl_interfaces.srv import SetParameters
 import tf2_py as tf2
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -39,8 +41,24 @@ that the entire environment has been explored.
 NO_FRONTIER_TIMEOUT = 15.0
 GOAL_RADIUS = 0.30
 MIN_GOAL_DISTANCE = 0.50
+# Frontier cells are clustered by 8-connected adjacency; a cluster whose extent (cell
+# count x resolution) is below this is ignored, so a single-cell gap next to the robot
+# doesn't out-rank a real corridor just for being closer.
+MIN_FRONTIER_SIZE = 0.0
 SUCCESS_COOLDOWN = 30.0
 FAILURE_COOLDOWN = 60.0
+
+# Total time budget for exploring before heading back to the start, whether or not the
+# maze was fully explored.
+MISSION_TIME_LIMIT = 4 * 60.0
+# Number of distinct AprilTags placed in the maze: once all are confirmed, head back
+# immediately rather than continuing to explore for the rest of the time budget.
+TARGET_TAG_COUNT = 12
+# Estimating the return trip from straight-line distance alone underestimates actual
+# corridor travel, so it's scaled up for a safety margin, plus a flat buffer on top.
+RETURN_DISTANCE_FACTOR = 2.5
+RETURN_SPEED_ESTIMATE = 0.15  # m/s, conservative average including turns
+RETURN_TIME_MARGIN = 15.0  # s
 
 
 class FrontierExplorer(Node):
@@ -286,8 +304,23 @@ class AprilTagMapper(Node):
                     marker.pose.orientation.w = 1.0
                     marker.scale.x = marker.scale.y = marker.scale.z = 0.25
                     marker.color.a = marker.color.g = 1.0
+
+                    label = Marker()
+                    label.header.frame_id = self.map_frame
+                    label.header.stamp = marker.header.stamp
+                    label.ns = 'apriltag_labels/'+key[0]
+                    label.id = key[1]
+                    label.type = Marker.TEXT_VIEW_FACING
+                    label.action = Marker.ADD
+                    label.text = str(key[1])
+                    label.pose.position.x, label.pose.position.y = position[0], position[1]
+                    label.pose.position.z = position[2] + 0.3
+                    label.pose.orientation.w = 1.0
+                    label.scale.z = 0.2
+                    label.color.a = label.color.r = label.color.g = label.color.b = 1.0
+
                     first = key not in self._found
-                    self._found[key] = marker
+                    self._found[key] = (marker, label)
                     updated = True
                     if first:
                         self.get_logger().info(f'Confirmed AprilTag {child}; found so far: {self.found_ids}')
@@ -301,12 +334,13 @@ class AprilTagMapper(Node):
     def _clock_reset(self, _jump):
         with self._lock:
             deletions = []
-            for marker in self._found.values():
-                deletion = Marker()
-                deletion.header.frame_id = self.map_frame
-                deletion.ns, deletion.id = marker.ns, marker.id
-                deletion.action = Marker.DELETE
-                deletions.append(deletion)
+            for pair in self._found.values():
+                for marker in pair:
+                    deletion = Marker()
+                    deletion.header.frame_id = self.map_frame
+                    deletion.ns, deletion.id = marker.ns, marker.id
+                    deletion.action = Marker.DELETE
+                    deletions.append(deletion)
             self._found.clear()
             self._pending.clear()
             self._exact_tf.clear()
@@ -318,7 +352,7 @@ class AprilTagMapper(Node):
 
     def _publish_markers(self):
         with self._lock:
-            markers = list(self._found.values())
+            markers = [marker for pair in self._found.values() for marker in pair]
         self.marker_pub.publish(MarkerArray(markers=markers))
 
     @property
@@ -412,7 +446,8 @@ def reachable_frontier_goals(grid, robot):
     """Search entire seeded free components; nearby seeds need Nav2 validation."""
     g = GridGeometry(grid)
     stats = dict(state='invalid map', total_free=0, connected=0, components=0,
-                 frontier_cells=0, clearance_rejected=0, seed_distance=None)
+                 frontier_cells=0, clearance_rejected=0, frontier_clusters=0,
+                 small_frontier_rejected=0, seed_distance=None)
     if not g.valid() or not all(math.isfinite(v) for v in robot):
         return [], stats
     stats['total_free'] = grid.data.count(0)
@@ -462,8 +497,37 @@ def reachable_frontier_goals(grid, robot):
             if any(g.inside((x+dx,y+dy)) and g.value((x+dx,y+dy)) > 0 for dx,dy in offsets):
                 stats['clearance_rejected'] += 1
                 continue
-            candidates.append((distance,y*g.w+x,g.world(current)))
+            candidates.append((distance,current,g.world(current)))
     stats['connected'] = len(visited)
+
+    # Cluster frontier cells by 8-connected adjacency so each candidate can be judged
+    # by its cluster's physical extent, not in isolation: a single-cell gap shouldn't
+    # out-rank a real corridor opening just for being closer to the robot.
+    frontier_cells = {cell for _,cell,_ in candidates}
+    cluster_of = {}
+    cluster_sizes = []
+    for start in frontier_cells:
+        if start in cluster_of:
+            continue
+        index = len(cluster_sizes)
+        cluster_of[start] = index
+        stack, size = [start], 0
+        while stack:
+            cx, cy = stack.pop()
+            size += 1
+            for dx in (-1,0,1):
+                for dy in (-1,0,1):
+                    neighbor = (cx+dx,cy+dy)
+                    if (dx or dy) and neighbor in frontier_cells and neighbor not in cluster_of:
+                        cluster_of[neighbor] = index
+                        stack.append(neighbor)
+        cluster_sizes.append(size)
+    stats['frontier_clusters'] = len(cluster_sizes)
+
+    before_size_filter = len(candidates)
+    candidates = [c for c in candidates if cluster_sizes[cluster_of[c[1]]]*g.res >= MIN_FRONTIER_SIZE]
+    stats['small_frontier_rejected'] = before_size_filter-len(candidates)
+
     selected = []
     for _, _, point in sorted(candidates):
         if math.dist(point,robot) <= GOAL_RADIUS:
@@ -640,15 +704,72 @@ def make_goal_pose(navigator, frame_id, x, y, robot, yaw=None):
     return goal_pose
 
 
-def wait_for_task(navigator):
+def wait_for_task(navigator, should_abort=None):
+    """Block until the current task ends, cancelling early if `should_abort()` fires.
+
+    Used so a frontier approach already in flight gets interrupted the moment it would
+    eat into the reserved return-to-start time, rather than only checking the budget
+    between goals.
+    """
+    aborted = False
     while rclpy.ok():
         if navigator.isTaskComplete():
             return navigator.getResult()
+        if not aborted and should_abort is not None and should_abort():
+            navigator.cancelTask()
+            aborted = True
         time.sleep(0.05)
     return TaskResult.CANCELED
 
 
-def explore(navigator, frontiers, validator):
+def estimate_return_seconds(robot, home):
+    """Conservative estimate of how long driving from `robot` back to `home` would take."""
+    return RETURN_DISTANCE_FACTOR * math.dist(robot, home) / RETURN_SPEED_ESTIMATE + RETURN_TIME_MARGIN
+
+
+def relax_yaw_tolerance(navigator, yaw_tolerance=math.pi):
+    """Make controller_server accept any final heading.
+
+    Only used for the return-to-start leg: we only care about reaching the starting
+    (x, y), not which way the robot ends up facing. `general_goal_checker` is the
+    goal_checker plugin name from param_nav2.yaml.
+    """
+    client = navigator.create_client(SetParameters, '/controller_server/set_parameters')
+    if not client.wait_for_service(timeout_sec=5.0):
+        navigator.get_logger().warning(
+            'controller_server/set_parameters unavailable; final orientation will '
+            'still be checked.')
+        navigator.destroy_client(client)
+        return
+    request = SetParameters.Request()
+    request.parameters = [ParameterMsg(
+        name='general_goal_checker.yaw_goal_tolerance',
+        value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=yaw_tolerance))]
+    future = client.call_async(request)
+    rclpy.spin_until_future_complete(navigator, future, timeout_sec=5.0)
+    navigator.destroy_client(client)
+
+
+def return_home(navigator, frontiers, home_position):
+    """Drive back to `home_position`; only the final (x, y) matters, not heading."""
+    navigator.get_logger().info(
+        f'Heading back to the starting point at x={home_position[0]:.2f}, '
+        f'y={home_position[1]:.2f}.')
+    relax_yaw_tolerance(navigator)
+    goal = make_goal_pose(navigator, 'map', *home_position, home_position, yaw=0.0)
+    accepted = navigator.goToPose(goal)
+    result = wait_for_task(navigator) if accepted else TaskResult.FAILED
+    end = frontiers.robot_position('map')
+    success = (result == TaskResult.SUCCEEDED and end is not None
+               and math.dist(end, home_position) <= GOAL_RADIUS)
+    if success:
+        navigator.get_logger().info('Back at the starting point.')
+    else:
+        navigator.get_logger().warning('Could not fully return to the starting point.')
+    return success
+
+
+def explore(navigator, frontiers, validator, apriltags, home_position, mission_deadline):
     policy = GoalPolicy()
     required_sequence = 0
     reports = {}
@@ -681,6 +802,14 @@ def explore(navigator, frontiers, validator):
             report('Waiting: robot TF missing or stale.')
             time.sleep(0.1)
             continue
+        if len(apriltags.found_ids) >= TARGET_TAG_COUNT:
+            navigator.get_logger().info(
+                f'All {TARGET_TAG_COUNT} AprilTags found: heading back to the starting point.')
+            return
+        if now >= mission_deadline - estimate_return_seconds(robot, home_position):
+            navigator.get_logger().info(
+                'Mission time budget reached: heading back to the starting point.')
+            return
         if sequence < required_sequence:
             policy.reset_idle()
             report('Waiting for a map or frontier update after the last action.')
@@ -698,7 +827,9 @@ def explore(navigator, frontiers, validator):
         report(f"Search: {stats['state']}; seed={seed_text}; free connected/total="
                f"{stats['connected']}/{stats['total_free']}; components={stats['components']}; "
                f"frontier cells={stats['frontier_cells']}; clearance rejected="
-               f"{stats['clearance_rejected']}; sampled candidates={len(alternatives)}", 'search')
+               f"{stats['clearance_rejected']}; clusters={stats['frontier_clusters']}; "
+               f"small frontier rejected={stats['small_frontier_rejected']}; "
+               f"sampled candidates={len(alternatives)}", 'search')
         if stats['connected'] and disconnected:
             report(f'Disconnected mapped free space: {disconnected} cells outside seeded components; '
                    'physical reachability is not established.', 'disconnected')
@@ -768,7 +899,13 @@ def explore(navigator, frontiers, validator):
             navigator.get_logger().info(
                 f'Heading to validated {source} at x={target[0]:.2f}, y={target[1]:.2f}')
             accepted = navigator.goToPose(make_goal_pose(navigator,frame,*target,robot,yaw=goal_heading))
-            result = wait_for_task(navigator) if accepted else TaskResult.FAILED
+            def time_to_go_home():
+                if len(apriltags.found_ids) >= TARGET_TAG_COUNT:
+                    return True
+                current = frontiers.robot_position(frame) or robot
+                now = frontiers.get_clock().now().nanoseconds/1e9
+                return now >= mission_deadline - estimate_return_seconds(current, home_position)
+            result = wait_for_task(navigator, should_abort=time_to_go_home) if accepted else TaskResult.FAILED
             end = frontiers.robot_position(frame)
             success = (result == TaskResult.SUCCEEDED and end is not None
                        and math.dist(end,target) <= GOAL_RADIUS)
@@ -839,6 +976,19 @@ def wait_for_navigation(navigator):
     navigator.get_logger().info('Nav2 is ready for use!')
 
 
+def wait_for_home_position(frontiers, timeout=15.0):
+    """Block until the robot's own TF-based position is available in the map frame, so
+    there's somewhere to return to once the mission's time budget runs out."""
+    deadline = time.monotonic() + timeout
+    while True:
+        position = frontiers.robot_position('map')
+        if position is not None:
+            return position
+        if time.monotonic() > deadline:
+            raise RuntimeError(f'No robot position in map frame after {timeout}s')
+        time.sleep(0.2)
+
+
 def main():
     # Keep the context alive during Ctrl+C so our finally block can cancel
     # the current action and join executor threads before shutting ROS down.
@@ -853,7 +1003,10 @@ def main():
         frontiers.start()
         apriltags.start()
         wait_for_navigation(navigator)
-        explore(navigator, frontiers, validator)
+        home_position = wait_for_home_position(frontiers)
+        mission_deadline = frontiers.get_clock().now().nanoseconds/1e9 + MISSION_TIME_LIMIT
+        explore(navigator, frontiers, validator, apriltags, home_position, mission_deadline)
+        return_home(navigator, frontiers, home_position)
     except KeyboardInterrupt:
         pass
     finally:
