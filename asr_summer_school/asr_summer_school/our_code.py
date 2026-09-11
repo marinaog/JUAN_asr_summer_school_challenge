@@ -1,7 +1,9 @@
 #! /usr/bin/env python3
 
 from collections import Counter, deque
+import json
 import math
+import os
 import threading
 import time
 
@@ -63,6 +65,12 @@ TARGET_TAG_COUNT = 12
 RETURN_DISTANCE_FACTOR = 2.5
 RETURN_SPEED_ESTIMATE = 0.15  # m/s, conservative average including turns
 RETURN_TIME_MARGIN = 15.0  # s
+
+# Persistent record of confirmed tag positions, written next to this script so it's
+# found regardless of the working directory our_code.py was launched from. Rewritten
+# on every new/refreshed confirmation, not just at mission end, so a crash mid-mission
+# doesn't lose what was already found.
+FOUND_TAGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'found_tags.json')
 
 
 class FrontierExplorer(Node):
@@ -357,6 +365,7 @@ class AprilTagMapper(Node):
             self._pending = remaining
             if updated:
                 self._publish_markers()
+                self._save_found_tags()
 
     def _clock_reset(self, _jump):
         with self._lock:
@@ -375,12 +384,32 @@ class AprilTagMapper(Node):
             self._last_image_stamp = -1
             if deletions:
                 self.marker_pub.publish(MarkerArray(markers=deletions))
+            self._save_found_tags()
             self.get_logger().info('ROS clock changed: cleared tag confirmations and pending observations.')
 
     def _publish_markers(self):
         with self._lock:
             markers = [marker for pair in self._found.values() for marker in pair]
         self.marker_pub.publish(MarkerArray(markers=markers))
+
+    def _save_found_tags(self):
+        """Persist confirmed tag positions to FOUND_TAGS_FILE (best-effort).
+
+        Called on every new/refreshed confirmation and on a clock reset, not just at
+        mission end, so a crash or Ctrl+C mid-mission doesn't lose what was already
+        found.
+        """
+        with self._lock:
+            positions = {
+                f'{family}:{tag_id}': {'x': marker.pose.position.x,
+                                        'y': marker.pose.position.y,
+                                        'z': marker.pose.position.z}
+                for (family, tag_id), (marker, _label) in self._found.items()}
+        try:
+            with open(FOUND_TAGS_FILE, 'w') as f:
+                json.dump(positions, f, indent=2, sort_keys=True)
+        except OSError as error:
+            self._warn('save', f'Could not save found tag positions to {FOUND_TAGS_FILE}: {error}')
 
     @property
     def found_ids(self):
@@ -1059,6 +1088,7 @@ def main():
                 navigator.cancelTask()
         if apriltags is not None:
             print(f'AprilTags found: {apriltags.found_ids}')
+            print(f'Positions saved to {FOUND_TAGS_FILE}')
             apriltags.stop()
         if frontiers is not None:
             frontiers.stop()
