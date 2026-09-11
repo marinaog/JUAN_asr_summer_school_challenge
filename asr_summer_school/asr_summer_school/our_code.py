@@ -46,11 +46,16 @@ GOAL_RADIUS = 0.30
 # goal naturally reveals more frontier cells right next to it, and those shouldn't get
 # blanket-suppressed just for being close to the goal just attempted.
 COOLDOWN_RADIUS = 0.15
-MIN_GOAL_DISTANCE = 0.50
+MIN_GOAL_DISTANCE = 0.40
 # Frontier cells are clustered by 8-connected adjacency; a cluster whose extent (cell
 # count x resolution) is below this is ignored, so a single-cell gap next to the robot
 # doesn't out-rank a real corridor just for being closer.
 MIN_FRONTIER_SIZE = 0.0
+# How strongly cluster size (meters) discounts a candidate's distance when ranking:
+# a cluster this many meters bigger is treated as if it were that many meters closer.
+# 0 = pure nearest-first (old behavior); raise to bias harder toward big new areas
+# (e.g. another room) over finishing small leftovers in the current one.
+SIZE_WEIGHT = 1.0
 SUCCESS_COOLDOWN = 30.0
 FAILURE_COOLDOWN = 60.0
 
@@ -505,16 +510,16 @@ def reachable_frontier_goals(grid, robot):
                  frontier_cells=0, clearance_rejected=0, frontier_clusters=0,
                  small_frontier_rejected=0, seed_distance=None)
     if not g.valid() or not all(math.isfinite(v) for v in robot):
-        return [], stats
+        return [], {}, stats
     stats['total_free'] = grid.data.count(0)
     cell = g.cell(robot)
     if not g.inside(cell):
         stats['state'] = 'robot outside map'
-        return [], stats
+        return [], {}, stats
     value = g.value(cell)
     stats['state'] = 'robot free' if value == 0 else 'robot unknown' if value == -1 else 'robot occupied'
     if value > 0:
-        return [], stats
+        return [], {}, stats
     if value == 0:
         seeds = [cell]
     else:
@@ -525,7 +530,7 @@ def reachable_frontier_goals(grid, robot):
         seeds.sort(key=lambda p: (math.dist(g.world(p),robot), p[1]*g.w+p[0]))
     if not seeds:
         stats['state'] += '; no free seed within 0.30 m'
-        return [], stats
+        return [], {}, stats
     stats['seed_distance'] = math.dist(g.world(seeds[0]), robot)
     visited, candidates = set(), []
     radius = math.ceil(0.20/g.res)
@@ -585,12 +590,14 @@ def reachable_frontier_goals(grid, robot):
     stats['small_frontier_rejected'] = before_size_filter-len(candidates)
 
     selected = []
-    for _, _, point in sorted(candidates):
+    sizes = {}
+    for _, cell, point in sorted(candidates):
         if math.dist(point,robot) <= GOAL_RADIUS:
             continue
         if all(math.dist(point,other) >= 0.40 for other in selected):
             selected.append(point)
-    return selected, stats
+            sizes[point] = cluster_sizes[cluster_of[cell]]*g.res
+    return selected, sizes, stats
 
 
 def validate_path(path, robot, target, frame):
@@ -730,16 +737,30 @@ class GoalPolicy:
         return now - self.idle_since >= NO_FRONTIER_TIMEOUT
 
 
-def rank_candidates(points, robot, heading):
-    """Prefer smaller turns among goals within 25 cm of the nearest distance."""
-    remaining = sorted(set(points), key=lambda p: (math.dist(p, robot), p))
+def rank_candidates(points, robot, heading, sizes=None):
+    """Prefer bigger unexplored regions over small local leftovers, then smaller turns
+    among goals within 25 cm of the nearest effective distance.
+
+    "Effective distance" subtracts SIZE_WEIGHT * cluster size (in meters, from
+    `sizes`) off the raw distance, so a frontier opening into a large unexplored area
+    (e.g. another room) gets tried before a merely-closer small leftover pocket --
+    without excluding the small ones outright, they just sort later instead of first.
+    Points with no entry in `sizes` (e.g. from frontier_detection_node, which carries
+    no cluster-size info) fall back to plain distance.
+    """
+    sizes = sizes or {}
+
+    def effective_distance(point):
+        return max(0.0, math.dist(point, robot) - SIZE_WEIGHT*sizes.get(point, 0.0))
+
+    remaining = sorted(set(points), key=lambda p: (effective_distance(p), p))
     ranked = []
     while remaining:
-        limit = math.dist(remaining[0], robot) + 0.25
-        group = [p for p in remaining if math.dist(p, robot) <= limit]
+        limit = effective_distance(remaining[0]) + 0.25
+        group = [p for p in remaining if effective_distance(p) <= limit]
         def key(point):
             angle = math.atan2(point[1]-robot[1], point[0]-robot[0])-heading
-            return abs(math.atan2(math.sin(angle), math.cos(angle))), math.dist(point, robot), point
+            return abs(math.atan2(math.sin(angle), math.cos(angle))), effective_distance(point), point
         ranked.extend(sorted(group, key=key))
         remaining = remaining[len(group):]
     return ranked
@@ -882,7 +903,7 @@ def explore(navigator, frontiers, validator, apriltags, home_position, mission_d
             report('Waiting: invalid occupancy grid.')
             time.sleep(0.1)
             continue
-        alternatives, stats = frontiers.search(grid,version,robot)
+        alternatives, alt_sizes, stats = frontiers.search(grid,version,robot)
         disconnected = stats['total_free']-stats['connected']
         seed = stats['seed_distance']
         seed_text = 'none' if seed is None else f'{seed:.2f} m'
@@ -912,7 +933,7 @@ def explore(navigator, frontiers, validator, apriltags, home_position, mission_d
             continue
         q = transform.transform.rotation
         heading = math.atan2(2*(q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z))
-        candidates = rank_candidates(eligible + recovered, robot, heading)
+        candidates = rank_candidates(eligible + recovered, robot, heading, sizes=alt_sizes)
         suppressed |= cooling
         filter_reasons = supplied_reasons + alt_reasons
         report(f'Goals: supplied={len(supplied)}, map-derived={len(alternatives)}, '
