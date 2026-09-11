@@ -174,9 +174,10 @@ class FrontierExplorer(Node):
 class TagObservations:
     """Confirm and refresh a tag only from three distinct, consistent images."""
 
-    def __init__(self):
+    def __init__(self, on_event=None):
         self.last_stamp = {}
         self.samples = {}
+        self.on_event = on_event or (lambda key, kind, detail: None)
 
     def add(self, key, stamp, position):
         if stamp <= self.last_stamp.get(key, -1):
@@ -184,13 +185,20 @@ class TagObservations:
         self.last_stamp[key] = stamp
         if not all(math.isfinite(v) for v in position):
             self.samples.pop(key, None)
+            self.on_event(key, 'non_finite', position)
             return None
         samples = self.samples.get(key, [])
-        if samples and (stamp-samples[0][0] > 2_000_000_000 or
-                        any(math.dist(position, p) > 0.20 for _, p in samples)):
-            samples = []
+        if samples:
+            spread = max(math.dist(position, p) for _, p in samples)
+            if stamp-samples[0][0] > 2_000_000_000:
+                self.on_event(key, 'window_expired', len(samples))
+                samples = []
+            elif spread > 0.20:
+                self.on_event(key, 'inconsistent', spread)
+                samples = []
         samples.append((stamp, position))
         self.samples[key] = samples
+        self.on_event(key, 'sample', len(samples))
         if len(samples) < 3:
             return None
         mean = tuple(sum(p[i] for _, p in samples)/3 for i in range(3))
@@ -208,7 +216,7 @@ class AprilTagMapper(Node):
         self.map_frame = map_frame
         self._lock = threading.RLock()
         self._found = {}
-        self._observations = TagObservations()
+        self._observations = TagObservations(on_event=self._observation_event)
         self._pending = deque()
         self._last_image_stamp = -1
         self._exact_tf = {}
@@ -253,6 +261,21 @@ class AprilTagMapper(Node):
         if now-self._warnings.get(key, -math.inf) >= 5.0:
             self.get_logger().warning(message)
             self._warnings[key] = now
+
+    def _observation_event(self, key, kind, detail):
+        # Throttled per tag: shows whether a tag is accumulating consistent samples,
+        # getting reset for spreading too far apart, or never reaching 3 at all.
+        child = f'{key[0]}:{key[1]}'
+        if kind == 'inconsistent':
+            self._warn(f'obs:{child}',
+                       f'{child}: samples reset, {detail:.2f} m spread exceeds 0.20 m.')
+        elif kind == 'window_expired':
+            self._warn(f'obs:{child}',
+                       f'{child}: samples reset, {detail} sample(s) spanned over 2.0 s.')
+        elif kind == 'non_finite':
+            self._warn(f'obs:{child}', f'{child}: discarded non-finite TF position.')
+        elif kind == 'sample':
+            self._warn(f'obs:{child}', f'{child}: {detail}/3 consistent samples so far.')
 
     def _tf_callback(self, msg):
         with self._lock:
@@ -344,7 +367,7 @@ class AprilTagMapper(Node):
             self._found.clear()
             self._pending.clear()
             self._exact_tf.clear()
-            self._observations = TagObservations()
+            self._observations = TagObservations(on_event=self._observation_event)
             self._last_image_stamp = -1
             if deletions:
                 self.marker_pub.publish(MarkerArray(markers=deletions))
