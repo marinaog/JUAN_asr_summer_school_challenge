@@ -44,7 +44,7 @@ GOAL_RADIUS = 0.30
 # goal naturally reveals more frontier cells right next to it, and those shouldn't get
 # blanket-suppressed just for being close to the goal just attempted.
 COOLDOWN_RADIUS = 0.15
-MIN_GOAL_DISTANCE = 0.10
+MIN_GOAL_DISTANCE = 0.50
 # Frontier cells are clustered by 8-connected adjacency; a cluster whose extent (cell
 # count x resolution) is below this is ignored, so a single-cell gap next to the robot
 # doesn't out-rank a real corridor just for being closer.
