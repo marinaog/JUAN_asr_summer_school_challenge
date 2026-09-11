@@ -803,6 +803,7 @@ def explore(navigator, frontiers, validator, apriltags, home_position, mission_d
     required_sequence = 0
     reports = {}
     rejections = Counter()
+    last_countdown = [0.0]
 
     def report(message, category='status'):
         previous, when = reports.get(category, (None, 0.0))
@@ -811,8 +812,19 @@ def explore(navigator, frontiers, validator, apriltags, home_position, mission_d
             navigator.get_logger().info(message)
             reports[category] = (message, now)
 
+    def print_countdown():
+        # Called both from the search loop below and from time_to_go_home() while a
+        # NavigateToPose leg is in flight, so the countdown keeps ticking during
+        # exploration and while actively driving, not just between goals.
+        now = frontiers.get_clock().now().nanoseconds/1e9
+        if now-last_countdown[0] >= 10.0:
+            remaining = max(0.0, mission_deadline-now)
+            navigator.get_logger().info(f'Mission time remaining: {remaining:.0f} s.')
+            last_countdown[0] = now
+
     while rclpy.ok():
         now = frontiers.get_clock().now().nanoseconds/1e9
+        print_countdown()
         clock_reset = policy.last_time is not None and now < policy.last_time
         policy.tick(now)
         points, point_frame, received, sequence = frontiers.snapshot()
@@ -937,6 +949,7 @@ def explore(navigator, frontiers, validator, apriltags, home_position, mission_d
                 f'Heading to validated {source} at x={target[0]:.2f}, y={target[1]:.2f}')
             accepted = navigator.goToPose(make_goal_pose(navigator,frame,*target,robot,yaw=goal_heading))
             def time_to_go_home():
+                print_countdown()
                 if len(apriltags.found_ids) >= TARGET_TAG_COUNT:
                     return True
                 current = frontiers.robot_position(frame) or robot
