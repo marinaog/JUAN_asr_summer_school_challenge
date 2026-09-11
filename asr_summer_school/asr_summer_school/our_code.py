@@ -897,7 +897,7 @@ def explore(navigator, frontiers, validator, apriltags, home_position, mission_d
         goal_heading = None
         infrastructure_failure = False
         changed = False
-        for candidate in candidates[:8]:
+        for candidate in candidates[:3]:
             goal = make_goal_pose(navigator,frame,*candidate,robot)
             outcome, reason = validator.check(goal,robot)
             if frontiers.map_snapshot()[2] != version:
@@ -993,7 +993,7 @@ def wait_for_navigation(navigator):
         client = navigator.create_client(GetState, f'/{name}/get_state')
         try:
             while rclpy.ok():
-                if not client.wait_for_service(timeout_sec=5.0):
+                if not client.wait_for_service(timeout_sec=3.0):
                     navigator.get_logger().info(f'Waiting for {name} lifecycle service.')
                     continue
                 future = client.call_async(GetState.Request())
